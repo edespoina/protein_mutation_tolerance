@@ -1,1 +1,271 @@
+```python
+from Bio.PDB import PDBList, PDBParser
+from Bio.PDB import PPBuilder
+import math
+from Bio.Align import substitution_matrices
+from Bio.PDB import NeighborSearch
+import random
+import os
+
+
+# Download the PDB file for 6E6O
+pdbl = PDBList()
+pdbl.retrieve_pdb_file('6E6O', file_format='pdb', pdir='.')
+
+# Load the structure
+parser = PDBParser(QUIET=True)
+structure = parser.get_structure("6E6O", "pdb6e6o.ent")
+
+# Select model 0 and chain Α for protein 6E6O
+model = structure[0]
+chain = model["A"]
+
+# Question 1(a)ii Verify that there are no chain breaks 
+
+# The normal distance between two Ca is ~3.8 Å 
+# So, check for chain breaks (distance > 4.5 Å)
+prev_ca = None
+distances = []
+threshold = 4.5  
+
+# Calculate the distance between Ca - Ca
+for residue in chain:
+    if "CA" not in residue:
+        continue
+
+    ca = residue["CA"]
+
+    if prev_ca is not None:
+        d = ca - prev_ca
+        distances.append(d)
+
+    prev_ca = ca
+
+# Identify breaks
+breaks = [d for d in distances if d > threshold]
+
+if len(breaks) == 0:
+    print("No chain breaks detected.")
+else:
+    print("Possible chain breaks:", breaks)
+
+
+# Question 2: 
+
+# Extract the amino-acid sequence from chain A
+ppb = PPBuilder() 
+peptides = ppb.build_peptides(chain)
+# 6E6O has a single continuous chain, 
+# so the list peptides contains exactly one polypeptide
+polypeptide = peptides[0]
+sequence = str(polypeptide.get_sequence())
+print("Native sequence:", sequence) 
+print("Sequence length:", len(sequence))
+
+def compute_burial(chain, cutoff=10.0, threshold=12): 
+    """
+    Decide which residues are buried or exposed based on how many Cα neighbors they have.
+    More neighbors -> residue is inside the protein (buried).
+    Fewer neighbors -> residue is on the surface (exposed).
+    """ 
+    # Collect all CA atoms from the chain
+    ca_atoms = [residue["CA"] for residue in chain if residue.has_id("CA")]
+    # Find nearby atoms
+    ns = NeighborSearch(ca_atoms)
+    # create a dictionary with residue_number → True (buried) or False (exposed)
+    burial = {}
+    # For each residue, count how many Cα atoms are close to it 
+    for residue in chain: 
+        if not residue.has_id("CA"): 
+            continue 
+        ca = residue["CA"]
+        # Find all Cα atoms within 10 Å 
+        neighbors = ns.search(ca.coord, cutoff) 
+        # Count neighbors (minus itself) 
+        count = len(neighbors) - 1
+        # If many neighbors → buried, else exposed 
+        burial[residue.get_id()[1]] = (count > threshold)
+    return burial
+
+# Load the BLOSUM62 substitution matrix
+blosum62 = substitution_matrices.load("BLOSUM62")
+# Full alphabet from the matrix (includes B, Z, X, *) 
+full_alphabet = blosum62.alphabet 
+# Keep only the 20 standard amino acids 
+standard_aas = "ARNDCQEGHILKMFPSTWYV"
+
+
+
+def blosum_probabilities(residue): 
+    """ Convert BLOSUM62 substitution scores (log‑odds) into a 
+    probability distribution for the given amino acid. """
+    # First, find index of the residue in the amino-acid order 
+    i = full_alphabet.index(residue)
+    # blosum62 is a numpy array
+    # extract the row of scores for residue i
+    scores = blosum62[i]
+    # Filter scores to keep only the 20 standard amino acids 
+    filtered_scores = [scores[full_alphabet.index(aa)] for aa in standard_aas]
+    # Convert log-odds scores to positive weights 
+    # (exponential is the reverse of log-odds)
+    weights = [math.exp(s) for s in filtered_scores]
+    # Normalize to probabilities, by dividing weights to the total
+    total = sum(weights) 
+    probabilities = [w / total for w in weights]
+    return standard_aas, probabilities
+
+
+# Side-chain volumes (Å^3), from IMGT
+sidechain_volume = {
+    "A":  88.6, "R": 173.4, "N": 114.1, "D": 111.1, "C": 108.5,
+    "Q": 143.8, "E": 138.4, "G": 60.1, "H": 153.2, "I": 166.7,
+    "L": 166.7, "K": 168.6, "M": 162.9, "F": 189.9, "P": 112.7,
+    "S": 89.0, "T": 116.1, "W": 227.8, "Y": 193.6, "V": 140.0
+}
+VOLUME_THRESHOLD = 40
+
+
+
+def mutate_sequence(seq, chain, percentage, seed=1): 
+    """ Mutate a sequence using BLOSUM62 probabilities and structural burial constraints. 
+    Buried residues -> conservative mutations only. 
+    Exposed residues -> full BLOSUM distribution. """ 
+    random.seed(seed)
+    seq = list(seq) 
+    length = len(seq) 
+    num_mutations = int(length * percentage) 
+    
+    positions = random.sample(range(length), num_mutations)
+
+    # Compute burial 
+    burial = compute_burial(chain)
+    
+    for pos in positions: 
+        original = seq[pos] 
+        # Get BLOSUM probabilities 
+        aas, probs = blosum_probabilities(original)
+
+        # If residue is buried → only conservative substitutions 
+        if burial[pos + 1]: # residue numbering starts at 1 
+            conservative = [] 
+            conservative_probs = []
+
+            for aa, p in zip(aas, probs): 
+                if aa == original: 
+                    continue
+
+                # Check BLOSUM score (conservative substitution)
+                score = blosum62[full_alphabet.index(original), full_alphabet.index(aa)] 
+                if score <= 0: 
+                    continue
+                
+                # Check side-chain volume compatibility 
+                if abs(sidechain_volume[aa] - sidechain_volume[original]) > VOLUME_THRESHOLD: 
+                    continue
+                
+                conservative.append(aa) 
+                conservative_probs.append(p)
+        
+            # Normalize conservative probabilities 
+            if len(conservative) == 0: 
+                # No allowed conservative mutation → skip mutation 
+                continue
+            total = sum(conservative_probs) 
+            conservative_probs = [p / total for p in conservative_probs]
+            seq[pos] = random.choices(conservative, weights=conservative_probs)[0] 
+        else: 
+            # Exposed residue → full BLOSUM distribution 
+            seq[pos] = random.choices(aas, weights=probs)[0] 
+    
+    return "".join(seq)
+
+
+# Question 3
+
+# Random seeds are fixed to ensure full reproducibility 
+levels = [5, 10, 15, 20, 25, 30, 40]
+mutants = {}
+seeds = [3,4,6]
+
+for level in levels: 
+    frac = level / 100 
+    mutants[level] = {}
+    for seed in seeds:
+        mutant_seq = mutate_sequence(sequence, chain, frac, seed=seed)
+        mutants[level][seed] = mutant_seq
+        # Sanity check: sequence length must be preserved 
+        # Only point substitutions are allowed (no insertions or deletions)
+        assert len(mutant_seq) == len(sequence)
+        
+        filename = f"mut_{level:02d}_seed{seed}.fasta"
+        with open(filename, "w") as file:
+            file.write(f">mutant_{level}_seed{seed}\n")
+            file.write(mutant_seq + "\n")
+
+
+# Mean pLDDT for mutants
+
+import os
+import numpy as np
+from Bio.PDB import PDBParser
+
+# Helper function
+def get_CA_coords(chain):
+    """
+    Extract CA atoms from a Bio.PDB chain.
+    """
+    ca_atoms = [atom for atom in chain.get_atoms() if atom.get_name() == "CA"]
+    return ca_atoms
+
+# Parameters
+native_file = "pdb6e6o.ent"       # native structure
+mutant_folder = "./mutants/"       # folder containing mutant PDBs
+mutation_levels = [5,10,15,20,25,30,40]
+seeds = [3,4,6]
+
+parser = PDBParser(QUIET=True)
+
+# Load native structure
+native_structure = parser.get_structure("native", native_file)
+native_chain = next(native_structure.get_chains())
+native_ca_atoms = get_CA_coords(native_chain)
+n_atoms = len(native_ca_atoms)
+print(f"Native sequence length: {n_atoms} residues")
+
+# Loop over mutants
+results = {}
+
+for level in mutation_levels:
+    results[level] = {}
+    for seed in seeds:
+        mutant_file = os.path.join(mutant_folder, f"mutant_{level:02d}_seed{seed}_1.pdb")
+        if not os.path.exists(mutant_file):
+            print(f"File {mutant_file} not found. Skipping.")
+            continue
+        
+        mutant_structure = parser.get_structure(f"mutant_{level}_{seed}", mutant_file)
+        mutant_chain = next(mutant_structure.get_chains())
+        mutant_ca_atoms = get_CA_coords(mutant_chain)
+        
+        if len(mutant_ca_atoms) != n_atoms:
+            print(f"WARNING: different number of CA atoms in {mutant_file}. Skipping.")
+            continue
+        
+        # Compute mean pLDDT from B-factor column
+        plddt_values = [atom.get_bfactor() for atom in mutant_ca_atoms]
+        mean_plddt = np.mean(plddt_values)
+        
+        results[level][seed] = mean_plddt
+        print(f"Level {level}%, Seed {seed} → mean pLDDT = {mean_plddt:.1f}")
+
+# Summary table
+print("\nSummary Table: mean pLDDT")
+header = "Level%\t" + "\t".join([f"Seed{seed}" for seed in seeds])
+print(header)
+
+for level in mutation_levels:
+    row = "\t".join([f"{results[level][seed]:.1f}" if seed in results[level] else "-" for seed in seeds])
+    print(f"{level}%\t{row}")
+
+```
 
